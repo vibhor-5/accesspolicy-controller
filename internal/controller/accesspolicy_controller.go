@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -32,114 +33,89 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
-
-	agenticv1alpha1 "sigs.k8s.io/kube-agentic-networking/api/v1alpha1"
+	gatewayapiv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	authorinov1beta3 "github.com/kuadrant/authorino/api/v1beta3"
 	kuadrantv1 "github.com/kuadrant/kuadrant-operator/api/v1"
-
-	"k8s.io/apimachinery/pkg/api/meta"
+	agenticv1alpha1 "sigs.k8s.io/kube-agentic-networking/api/v1alpha1"
 )
 
 const gatewayKind = "Gateway"
 
-// AccessPolicyReconciler reconciles a AccessPolicy object
-type AccessPolicyReconciler struct {
+// GatewayPolicyReconciler reconciles a Gateway object to generate AuthPolicies based on XAccessPolicies
+type GatewayPolicyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=agentic.networking.x-k8s.io,resources=accesspolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=agentic.networking.x-k8s.io,resources=accesspolicies/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=agentic.networking.x-k8s.io,resources=accesspolicies/finalizers,verbs=update
+// +kubebuilder:rbac:groups=agentic.networking.x-k8s.io,resources=xaccesspolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=agentic.networking.x-k8s.io,resources=xaccesspolicies/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=agentic.networking.x-k8s.io,resources=xaccesspolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kuadrant.io,resources=authpolicies,verbs=get;list;watch;create;update;patch;delete
 
-func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *GatewayPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	var policy agenticv1alpha1.AccessPolicy
-	if err := r.Get(ctx, req.NamespacedName, &policy); err != nil {
+	var gateway gatewayapiv1.Gateway
+	if err := r.Get(ctx, req.NamespacedName, &gateway); err != nil {
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	if len(policy.Spec.TargetRefs) == 0 {
-		return ctrl.Result{}, nil
-	}
-
-	targetRef := policy.Spec.TargetRefs[0]
-	if string(targetRef.Kind) != gatewayKind {
-		r.updateStatus(&policy, targetRef, agenticv1alpha1.PolicyConditionAccepted, metav1.ConditionFalse, gatewayapiv1.PolicyReasonInvalid, "TargetRef must be Gateway")
-		return ctrl.Result{}, r.Status().Update(ctx, &policy)
-	}
-
-	var gateway gatewayapiv1.Gateway
-	gwName := types.NamespacedName{Namespace: policy.Namespace, Name: string(targetRef.Name)}
-	if err := r.Get(ctx, gwName, &gateway); err != nil {
-		r.updateStatus(&policy, targetRef, agenticv1alpha1.PolicyConditionAccepted, metav1.ConditionFalse, gatewayapiv1.PolicyReasonTargetNotFound, "Gateway not found")
-		_ = r.Status().Update(ctx, &policy)
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	// Fetch all XAccessPolicies targeting this gateway
 	var policyList agenticv1alpha1.AccessPolicyList
-	if err := r.List(ctx, &policyList, client.InNamespace(policy.Namespace)); err != nil {
+	if err := r.List(ctx, &policyList, client.InNamespace(gateway.Namespace)); err != nil {
 		return ctrl.Result{}, err
-	}
-
-	// Enforcement of ExternalAuth limits (only one allowed)
-	if policy.Spec.Action == agenticv1alpha1.ActionTypeExternalAuth {
-		for _, p := range policyList.Items {
-			if len(p.Spec.TargetRefs) > 0 && string(p.Spec.TargetRefs[0].Name) == gateway.Name && p.Spec.Action == agenticv1alpha1.ActionTypeExternalAuth {
-				// If another ExternalAuth policy exists and is older than this one
-				if p.UID != policy.UID && p.CreationTimestamp.Before(&policy.CreationTimestamp) {
-					r.updateStatus(&policy, targetRef, agenticv1alpha1.PolicyConditionAccepted, metav1.ConditionFalse, agenticv1alpha1.PolicyLimitPerTargetExceeded, "Another ExternalAuth policy already targets this Gateway")
-					return ctrl.Result{}, r.Status().Update(ctx, &policy)
-				}
-			}
-		}
 	}
 
 	var allowPredicates []string
 	var denyPredicates []string
-	allValid := true
+	var targetPolicies []agenticv1alpha1.AccessPolicy
 
-	for i := range policyList.Items {
-		p := &policyList.Items[i]
-		if len(p.Spec.TargetRefs) == 0 || string(p.Spec.TargetRefs[0].Name) != gateway.Name {
-			continue
-		}
-		if p.Spec.Action == agenticv1alpha1.ActionTypeExternalAuth {
-			// ExternalAuth is effectively ignored for generating the AuthPolicy combined-rules here
-			// because Kuadrant handles it differently. We just skip generating rules for it.
+	for _, policy := range policyList.Items {
+		if len(policy.Spec.TargetRefs) == 0 {
 			continue
 		}
 
-		for _, rule := range p.Spec.Rules {
-			if rule.Source.Type == agenticv1alpha1.AuthorizationSourceTypeSPIFFE {
+		isTargetingGateway := false
+		for _, targetRef := range policy.Spec.TargetRefs {
+			if string(targetRef.Kind) == gatewayKind && string(targetRef.Name) == gateway.Name {
+				isTargetingGateway = true
+				break
+			}
+		}
+
+		if !isTargetingGateway {
+			continue
+		}
+
+		if string(policy.Spec.Action) == "ExternalAuth" {
+			r.updateStatus(&policy, gateway.Name, "Accepted", metav1.ConditionFalse, "InvalidTarget", "UnsupportedFeature: ExternalAuth is not supported by this controller")
+			_ = r.Status().Update(ctx, &policy)
+			continue
+		}
+
+		targetPolicies = append(targetPolicies, policy)
+
+		for _, rule := range policy.Spec.Rules {
+			if rule.Source != nil && string(rule.Source.Type) == "SPIFFE" {
 				continue
 			}
 
-			// Bypass source identity check for MVP since we are only testing Tool Name auth via anonymous proxy
 			var ruleExpr string
-
 			var authExpr string
 			if rule.Authorization != nil {
 				if string(rule.Authorization.Type) == "CEL" && rule.Authorization.CEL != nil {
 					authExpr = rule.Authorization.CEL.Expression
-					// Translate MCP Tool Name pseudo-variable to a safe proxy HTTP header check
-					safeHeaderCheck := "(has(request.headers) && 'x-mcp-toolname' in request.headers ? request.headers['x-mcp-toolname'] : '')"
+					safeHeaderCheck := "(has(request.headers['x-mcp-toolname']) ? request.headers['x-mcp-toolname'] : '')"
 					authExpr = strings.ReplaceAll(authExpr, "request.mcp.tool_name", safeHeaderCheck)
-				} else if string(rule.Authorization.Type) == "Inline" {
+				} else if string(rule.Authorization.Type) == "Inline" && rule.Authorization.MCP != nil {
 					var methodExprs []string
-					if len(rule.Authorization.MCP.Methods) > 0 {
-						for _, m := range rule.Authorization.MCP.Methods {
-							if string(m.Name) == "tools/call" && len(m.Params) > 0 {
-								methodExprs = append(methodExprs, fmt.Sprintf("request.headers['x-mcp-toolname'] == '%s'", m.Params[0]))
-							}
+					for _, m := range rule.Authorization.MCP.Methods {
+						if string(m.Name) == "tools/call" && len(m.Params) > 0 {
+							methodExprs = append(methodExprs, fmt.Sprintf("has(request.headers['x-mcp-toolname']) && request.headers['x-mcp-toolname'] == '%s'", m.Params[0]))
 						}
 					}
 					if len(methodExprs) > 0 {
@@ -159,12 +135,16 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				finalExpr = "true"
 			}
 
-			if p.Spec.Action == agenticv1alpha1.ActionTypeAllow || p.Spec.Action == "" {
+			if string(policy.Spec.Action) == "Allow" || string(policy.Spec.Action) == "" {
 				allowPredicates = append(allowPredicates, finalExpr)
-			} else if string(p.Spec.Action) == "Deny" {
+			} else if string(policy.Spec.Action) == "Deny" {
 				denyPredicates = append(denyPredicates, finalExpr)
 			}
 		}
+	}
+
+	if len(targetPolicies) == 0 {
+		return ctrl.Result{}, nil
 	}
 
 	var combinedExpr string
@@ -204,12 +184,8 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		authPolicy.Labels["app.kubernetes.io/managed-by"] = "accesspolicy-controller"
 
-		if err := controllerutil.SetControllerReference(&policy, authPolicy, r.Scheme); err != nil {
-			log.Error(err, "unable to set owner reference")
-		}
-
-		authPolicy.Spec.TargetRef = gatewayapiv1.LocalPolicyTargetReferenceWithSectionName{
-			LocalPolicyTargetReference: gatewayapiv1.LocalPolicyTargetReference{
+		authPolicy.Spec.TargetRef = gatewayapiv1alpha2.LocalPolicyTargetReferenceWithSectionName{
+			LocalPolicyTargetReference: gatewayapiv1alpha2.LocalPolicyTargetReference{
 				Group: "gateway.networking.k8s.io",
 				Kind:  gatewayKind,
 				Name:  gatewayapiv1.ObjectName(gateway.Name),
@@ -241,102 +217,81 @@ func (r *AccessPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	})
 
 	if err != nil {
-		r.updateStatus(&policy, targetRef, agenticv1alpha1.PolicyConditionAccepted, metav1.ConditionFalse, gatewayapiv1.PolicyReasonInvalid, "ProgramError: "+err.Error())
-		_ = r.Status().Update(ctx, &policy)
+		for _, policy := range targetPolicies {
+			p := policy
+			r.updateStatus(&p, gateway.Name, "Programmed", metav1.ConditionFalse, "ProgramError", err.Error())
+			_ = r.Status().Update(ctx, &p)
+		}
 		return ctrl.Result{}, err
 	}
 
 	log.Info("Reconciled AuthPolicy", "operation", op)
 
-	if allValid {
-		r.updateStatus(&policy, targetRef, agenticv1alpha1.PolicyConditionAccepted, metav1.ConditionTrue, agenticv1alpha1.PolicyReasonAccepted, "Policy accepted and valid")
-		if err := r.Status().Update(ctx, &policy); err != nil {
-			return ctrl.Result{}, err
-		}
+	for _, policy := range targetPolicies {
+		p := policy
+		r.updateStatus(&p, gateway.Name, "Programmed", metav1.ConditionTrue, "Programmed", "Successfully programmed Kuadrant AuthPolicy")
+		r.updateStatus(&p, gateway.Name, "Accepted", metav1.ConditionTrue, "Accepted", "Policy accepted and valid")
+		_ = r.Status().Update(ctx, &p)
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (r *AccessPolicyReconciler) updateStatus(policy *agenticv1alpha1.AccessPolicy, targetRef gatewayapiv1.LocalPolicyTargetReferenceWithSectionName, conditionType gatewayapiv1.PolicyConditionType, status metav1.ConditionStatus, reason gatewayapiv1.PolicyConditionReason, message string) {
-	var ancestor *gatewayapiv1.PolicyAncestorStatus
-
-	gwGroup := gatewayapiv1.Group("gateway.networking.k8s.io")
-	gwKind := gatewayapiv1.Kind("Gateway")
-	if targetRef.Group != "" {
-		gwGroup = targetRef.Group
-	}
-	if targetRef.Kind != "" {
-		gwKind = targetRef.Kind
-	}
-	gwNamespace := gatewayapiv1.Namespace(policy.Namespace)
-
-	ancestorRef := gatewayapiv1.ParentReference{
-		Group:     &gwGroup,
-		Kind:      &gwKind,
-		Namespace: &gwNamespace,
-		Name:      targetRef.Name,
-	}
-
+func (r *GatewayPolicyReconciler) updateStatus(policy *agenticv1alpha1.AccessPolicy, gatewayName string, conditionType string, status metav1.ConditionStatus, reason, message string) {
+	var ancestor *gatewayapiv1alpha2.PolicyAncestorStatus
 	for i := range policy.Status.Ancestors {
-		if policy.Status.Ancestors[i].AncestorRef.Group != nil && *policy.Status.Ancestors[i].AncestorRef.Group == gwGroup &&
-			policy.Status.Ancestors[i].AncestorRef.Kind != nil && *policy.Status.Ancestors[i].AncestorRef.Kind == gwKind &&
-			policy.Status.Ancestors[i].AncestorRef.Name == targetRef.Name {
+		if string(policy.Status.Ancestors[i].AncestorRef.Name) == gatewayName {
 			ancestor = &policy.Status.Ancestors[i]
 			break
 		}
 	}
 
 	if ancestor == nil {
-		policy.Status.Ancestors = append(policy.Status.Ancestors, gatewayapiv1.PolicyAncestorStatus{
-			AncestorRef:    ancestorRef,
-			ControllerName: "agentic.networking.x-k8s.io/accesspolicy-controller",
+		policy.Status.Ancestors = append(policy.Status.Ancestors, gatewayapiv1alpha2.PolicyAncestorStatus{
+			AncestorRef: gatewayapiv1alpha2.ParentReference{
+				Group: "gateway.networking.k8s.io",
+				Kind:  gatewayKind,
+				Name:  gatewayapiv1.ObjectName(gatewayName),
+			},
 		})
 		ancestor = &policy.Status.Ancestors[len(policy.Status.Ancestors)-1]
 	}
 
 	meta.SetStatusCondition(&ancestor.Conditions, metav1.Condition{
-		Type:               string(conditionType),
+		Type:               conditionType,
 		Status:             status,
-		Reason:             string(reason),
+		Reason:             reason,
 		Message:            message,
 		ObservedGeneration: policy.Generation,
 	})
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *AccessPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *GatewayPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&agenticv1alpha1.AccessPolicy{}).
+		For(&gatewayapiv1.Gateway{}).
 		Owns(&kuadrantv1.AuthPolicy{}).
 		Watches(
-			&gatewayapiv1.Gateway{},
-			handler.EnqueueRequestsFromMapFunc(r.findPoliciesForGateway),
+			&agenticv1alpha1.AccessPolicy{},
+			handler.EnqueueRequestsFromMapFunc(r.findGatewaysForPolicy),
 		).
 		Complete(r)
 }
 
-func (r *AccessPolicyReconciler) findPoliciesForGateway(ctx context.Context, obj client.Object) []reconcile.Request {
-	gateway, ok := obj.(*gatewayapiv1.Gateway)
-	if !ok {
-		return nil
-	}
-
-	var policyList agenticv1alpha1.AccessPolicyList
-	if err := r.List(ctx, &policyList, client.InNamespace(gateway.Namespace)); err != nil {
+func (r *GatewayPolicyReconciler) findGatewaysForPolicy(ctx context.Context, obj client.Object) []reconcile.Request {
+	policy, ok := obj.(*agenticv1alpha1.AccessPolicy)
+	if !ok || len(policy.Spec.TargetRefs) == 0 {
 		return nil
 	}
 
 	var requests []reconcile.Request
-	for _, p := range policyList.Items {
-		if len(p.Spec.TargetRefs) > 0 && string(p.Spec.TargetRefs[0].Name) == gateway.Name {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      p.Name,
-					Namespace: p.Namespace,
-				},
-			})
-		}
+	for _, targetRef := range policy.Spec.TargetRefs {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      string(targetRef.Name),
+				Namespace: policy.Namespace,
+			},
+		})
 	}
 	return requests
 }

@@ -115,5 +115,3 @@ require (
 )
 
 replace sigs.k8s.io/gateway-api => sigs.k8s.io/gateway-api v1.1.0
-
-replace github.com/kuadrant/policy-machinery => ./policy-machinery-fork
